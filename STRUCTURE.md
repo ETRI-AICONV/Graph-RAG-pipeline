@@ -23,46 +23,6 @@ hotpot_git/
 └── .gitignore                          # Git 제외 파일
 ```
 
-## 파일 크기
-
-- **총 Python 코드**: ~3,541 줄 (10개 파일)
-- **가장 큰 파일**: generator.py (738줄)
-- **가장 작은 파일**: config.py (23줄)
-
-## 모듈 의존성
-
-```
-main.py (main)
-    ├── src.config
-    ├── src.models
-    ├── src.cache
-    ├── src.losses
-    ├── src.retriever
-    ├── src.generator
-    └── src.evaluation
-
-src.models
-    └── src.config
-
-src.cache
-    ├── src.config
-    ├── utils.graph_utils
-    └── utils.gpu_utils
-
-src.retriever
-    ├── src.config
-    ├── src.models
-    ├── src.cache
-    ├── src.losses
-    └── utils.graph_utils
-
-src.generator
-    └── src.config
-
-src.evaluation
-    ├── src.config
-    └── utils.graph_utils
-```
 
 ## 실행 방법
 
