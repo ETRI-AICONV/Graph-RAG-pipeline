@@ -69,11 +69,3 @@ src.evaluation
 ```bash
 python main.py --samples 100 --retriever_epochs 5 --generator_epochs 2
 ```
-
-## 주요 변경사항
-
-1. OK: **불필요한 파일 제거**: pipeline.py, query_sentence_pipeline/, 비교 문서 등
-2. OK: **MD 파일 통합**: README.md, README_PUBLIC.md, QUICKSTART.md → README.md
-3. OK: **Python 모듈화**: 2,498줄 단일 파일 → 10개 모듈로 분리
-4. OK: **폴더 구조화**: src/ (핵심 모듈), utils/ (유틸리티)
-5. OK: **특수기호 제거**: 모든 파일에서 이모지 제거
