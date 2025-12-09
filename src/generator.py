@@ -1,0 +1,745 @@
+"""
+HotpotQA Graph-RAG Pipeline - Modular Components
+"""
+
+import os
+import sys
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import numpy as np
+from tqdm import tqdm
+import pickle
+import re
+import io
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from threading import Lock
+
+# Add current directory to path
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+# Import utilities
+from utils.graph_utils import flatten_context, get_gold_indices, supporting_fact_em, supporting_fact_f1, batch_embed, build_hierarchical_graph
+from utils.gpu_utils import set_device_auto, get_available_gpus
+from .config import DEVICE, AVAILABLE_GPUS, MODEL_NAME, HIDDEN_DIM, GNN_LAYERS, THRESHOLD
+
+from transformers import AutoTokenizer, AutoModelForSeq2SeqLM, Seq2SeqTrainingArguments, Seq2SeqTrainer, DataCollatorForSeq2Seq
+from datasets import Dataset, DatasetDict
+import torch.distributed as dist
+
+# ==================== T5 Generation ====================
+def normalize_answer(s: str) -> str:
+    """HotpotQA 표준 정규화"""
+    import string
+    
+    # 소문자 변환
+    s = s.lower()
+    
+    # 구두점 제거 (마침표, 쉼표 등)
+    s = s.translate(str.maketrans("", "", string.punctuation))
+    
+    # 공백 정규화
+    s = re.sub(r"\s+", " ", s)
+    s = s.strip()
+    
+    return s
+
+def compute_answer_em_f1(pred: str, gold: str):
+    p = normalize_answer(pred)
+    g = normalize_answer(gold)
+    em = 1.0 if p == g else 0.0
+    p_tokens = p.split()
+    g_tokens = g.split()
+    if len(p_tokens) == 0 or len(g_tokens) == 0:
+        return em, 0.0
+    common = set(p_tokens) & set(g_tokens)
+    if len(common) == 0:
+        return em, 0.0
+    prec = len(common) / len(p_tokens)
+    rec = len(common) / len(g_tokens)
+    f1 = 2 * prec * rec / (prec + rec) if (prec + rec) > 0 else 0.0
+    return em, f1
+
+def format_fid_input(question: str, evidences: list, max_evidences: int = 3, for_training=False) -> str:
+    """
+    Format input for FiD
+    - for_training=True: Simple concat (for training compatibility)
+    - for_training=False: Return dict for FiD generation (each passage encoded separately)
+    """
+    evidences = evidences[:max_evidences]
+    if for_training:
+        # For training: simple concat (compatible with existing training code)
+        context = " ".join(evidences)
+        return f"question: {question} context: {context}"
+    else:
+        # For evaluation: return dict for FiD generation
+        return {"question": question, "evidences": evidences}
+
+def fid_generate(model, tokenizer, question: str, evidences: list, max_evidences: int = 3, 
+                 max_new_tokens=20, device="cuda"):
+    """
+    FiD generation: Encode each passage separately, then concat for decoder
+    Uses actual evidences count (up to max_evidences limit)
+    """
+    model.eval()
+    # Use actual evidences count dynamically (up to max_evidences limit)
+    evidences = evidences[:max_evidences] if max_evidences > 0 else evidences
+    
+    # Format each passage with question
+    passage_inputs = []
+    for passage in evidences:
+        text = f"question: {question} context: {passage}"
+        passage_inputs.append(text)
+    
+    # Encode each passage separately
+    encoder_outputs_list = []
+    attention_masks_list = []
+    
+    with torch.no_grad():
+        for passage_text in passage_inputs:
+            inputs = tokenizer(
+                passage_text, 
+                return_tensors='pt', 
+                truncation=True, 
+                max_length=512,  # Per-passage max length
+                padding='max_length'
+            ).to(device)
+            
+            # Get encoder outputs
+            encoder_outputs = model.get_encoder()(
+                input_ids=inputs['input_ids'],
+                attention_mask=inputs['attention_mask']
+            )
+            encoder_outputs_list.append(encoder_outputs.last_hidden_state)
+            attention_masks_list.append(inputs['attention_mask'])
+        
+        # Concatenate all encoder outputs
+        # Shape: (batch_size, total_seq_len, hidden_size)
+        concat_encoder_outputs = torch.cat(encoder_outputs_list, dim=1)
+        concat_attention_mask = torch.cat(attention_masks_list, dim=1)
+        
+        # Prepare decoder inputs
+        decoder_start_token_id = None
+        if hasattr(model.config, 'decoder_start_token_id'):
+            decoder_start_token_id = model.config.decoder_start_token_id
+        elif tokenizer.pad_token_id is not None:
+            decoder_start_token_id = tokenizer.pad_token_id
+        else:
+            decoder_start_token_id = tokenizer.eos_token_id
+        
+        # Generate with concatenated encoder outputs
+        # T5 expects encoder_outputs as a tuple (last_hidden_state,)
+        # Note: decoder_input_ids is not needed, generate() will create it automatically
+        
+        outputs = model.generate(
+            encoder_outputs=(concat_encoder_outputs,),
+            attention_mask=concat_attention_mask,
+            max_new_tokens=max_new_tokens,
+            min_length=1,
+            num_beams=1,
+            early_stopping=False,
+            do_sample=False,
+            pad_token_id=tokenizer.pad_token_id or tokenizer.eos_token_id,
+            eos_token_id=tokenizer.eos_token_id,
+            repetition_penalty=1.2,
+            no_repeat_ngram_size=3
+        )
+    
+    return outputs
+
+class FiDModelWrapper(nn.Module):
+    """
+    FiD Model Wrapper: Encodes each passage separately, then concats for decoder
+    """
+    def __init__(self, base_model):
+        super().__init__()
+        self.base_model = base_model
+        self.config = base_model.config
+    
+    def forward(self, input_ids=None, attention_mask=None, labels=None, **kwargs):
+        """
+        FiD forward: Each passage is encoded separately, then concat
+        input_ids: (batch_size, num_passages, seq_len) or (batch_size, seq_len)
+        """
+        # Filter out Trainer-specific arguments that model doesn't accept
+        model_kwargs = {k: v for k, v in kwargs.items() 
+                       if k not in ['num_items_in_batch', 'return_loss']}
+        
+        # If input_ids is 3D, it means we have multiple passages per sample (FiD structure)
+        if input_ids is not None and input_ids.dim() == 3:
+            batch_size, num_passages, seq_len = input_ids.shape
+            
+            # FiD: Encode each passage separately
+            encoder_outputs_list = []
+            attention_masks_list = []
+            
+            # Use torch.no_grad() is not needed here (training mode), but we'll optimize memory
+            for p_idx in range(num_passages):
+                passage_input_ids = input_ids[:, p_idx, :]  # (batch_size, seq_len)
+                passage_attention_mask = attention_mask[:, p_idx, :] if attention_mask is not None else None
+                
+                # Skip empty passages (all padding) - dynamically handle variable passage counts
+                # Check if this passage has any non-padding tokens across the batch
+                if passage_attention_mask is not None:
+                    # Sum across sequence length for each sample: (batch_size,)
+                    passage_lengths = passage_attention_mask.sum(dim=1)
+                    # Check if any sample in batch has non-empty passage
+                    if passage_lengths.sum().item() == 0:
+                        continue  # Skip completely empty passages (all samples are padding)
+                
+                # Get encoder outputs for this passage
+                encoder_outputs = self.base_model.get_encoder()(
+                    input_ids=passage_input_ids,
+                    attention_mask=passage_attention_mask
+                )
+                # Detach and keep only last_hidden_state to save memory
+                hidden_state = encoder_outputs.last_hidden_state.detach()  # Detach to save memory
+                encoder_outputs_list.append(hidden_state)
+                if passage_attention_mask is not None:
+                    attention_masks_list.append(passage_attention_mask)
+                
+                # Clear intermediate encoder_outputs to free memory
+                del encoder_outputs
+                # Periodic garbage collection (less frequent for speed)
+                if p_idx == num_passages - 1:  # Only at end of all passages
+                    import gc
+                    gc.collect()
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+            
+            if not encoder_outputs_list:
+                # All passages were empty, use first passage anyway
+                passage_input_ids = input_ids[:, 0, :]
+                passage_attention_mask = attention_mask[:, 0, :] if attention_mask is not None else None
+                encoder_outputs = self.base_model.get_encoder()(
+                    input_ids=passage_input_ids,
+                    attention_mask=passage_attention_mask
+                )
+                encoder_outputs_list = [encoder_outputs.last_hidden_state]
+                if passage_attention_mask is not None:
+                    attention_masks_list = [passage_attention_mask]
+            
+            # Concatenate all encoder outputs
+            concat_encoder_outputs = torch.cat(encoder_outputs_list, dim=1)  # (batch_size, total_seq_len, hidden_size)
+            concat_attention_mask = torch.cat(attention_masks_list, dim=1) if attention_masks_list else None
+            
+            # Use decoder with concatenated encoder outputs
+            from transformers.modeling_outputs import BaseModelOutput
+            encoder_outputs = BaseModelOutput(
+                last_hidden_state=concat_encoder_outputs,
+                hidden_states=None,
+                attentions=None
+            )
+            
+            # Forward with concatenated encoder outputs and labels
+            outputs = self.base_model(
+                encoder_outputs=encoder_outputs,
+                attention_mask=concat_attention_mask,
+                labels=labels,
+                **model_kwargs
+            )
+            
+            return outputs
+        else:
+            # Standard forward (single passage per sample) - should not happen in FiD training
+            # This means input_ids is 2D, which is not FiD structure
+            if input_ids is not None and input_ids.dim() == 2:
+                import warnings
+                warnings.warn(f"WARNING:  FiD ModelWrapper received 2D input_ids (shape: {input_ids.shape}). "
+                           f"This is not FiD structure! Expected 3D (batch, num_passages, seq_len).")
+            return self.base_model(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                labels=labels,
+                **model_kwargs
+            )
+    
+    def generate(self, *args, **kwargs):
+        """Delegate generate to base model"""
+        return self.base_model.generate(*args, **kwargs)
+    
+    def get_encoder(self):
+        """Delegate get_encoder to base model"""
+        return self.base_model.get_encoder()
+    
+    def save_pretrained(self, save_directory, **kwargs):
+        """Save base model only (not the wrapper)"""
+        return self.base_model.save_pretrained(save_directory, **kwargs)
+    
+    def __getattr__(self, name):
+        """Delegate other attributes to base model"""
+        try:
+            return super().__getattr__(name)
+        except AttributeError:
+            return getattr(self.base_model, name)
+
+def prepare_t5_training_data(cache, mode="gold"):
+    """Prepare T5 training data
+    mode: 'gold' = use gold supporting facts, 'retrieved' = use retrieved facts
+    """
+    data = []
+    for sid, entry in cache.items():
+        try:
+            question = entry.get("question", "")
+            answer = entry.get("answer", "")
+            
+            if not question or not answer:
+                continue
+            
+            if mode == "gold":
+                # Use gold supporting facts
+                gold_idx = entry.get("gold", [])
+                evidences = [entry["sents"][i] for i in gold_idx if i < len(entry["sents"])]
+            else:
+                # Use retrieved facts (requires model)
+                raise NotImplementedError("Retrieved mode requires passing model")
+            
+            if evidences:
+                data.append({
+                    "question": question,
+                    "evidences": evidences,  # Keep as list for FiD format
+                    "answer": answer
+                })
+        except Exception as e:
+            print(f"Error preparing data for sample {sid}: {e}")
+            continue
+    
+    return data
+
+# Custom Trainer class for FiD (supports both single and multi-GPU)
+class FiDSeq2SeqTrainer(Seq2SeqTrainer):
+    """Seq2SeqTrainer with FiD-specific handling (supports multi-GPU)"""
+    
+    def _nested_gather(self, tensors, name=None):
+        """Override to handle distributed gather safely"""
+        if not isinstance(tensors, (list, tuple)):
+            tensors = [tensors]
+        # If distributed is not initialized, just return the tensor
+        if not (dist.is_available() and dist.is_initialized()):
+            return tensors[0] if len(tensors) == 1 else tensors
+        return super()._nested_gather(tensors, name)
+    
+    def store_flos(self):
+        """Override to handle distributed broadcast in store_flos"""
+        if dist.is_available() and dist.is_initialized():
+            return super().store_flos()
+        # If not distributed, just store locally without broadcast
+        try:
+            if hasattr(self.state, 'total_flos') and self.state.total_flos:
+                self.current_flos = sum(self.state.total_flos.values())
+            else:
+                self.current_flos = 0
+        except:
+            self.current_flos = 0
+        return
+    
+    def save_model(self, output_dir=None, _internal_call=False):
+        """Override save_model to save base_model only (for FiD wrapper)"""
+        output_dir = output_dir if output_dir is not None else self.args.output_dir
+        os.makedirs(output_dir, exist_ok=True)
+        
+        # If model is FiDModelWrapper, save base_model only
+        # Handle both wrapped (DDP) and unwrapped models
+        model_to_save = self.model
+        if hasattr(model_to_save, 'module'):  # DDP wrapped
+            model_to_save = model_to_save.module
+        if hasattr(model_to_save, 'base_model'):  # FiD wrapper
+            print(f"[FiD Trainer] Saving base_model only (not wrapper) to {output_dir}")
+            # Only save on main process (rank 0)
+            if not (dist.is_available() and dist.is_initialized()) or dist.get_rank() == 0:
+                model_to_save.base_model.save_pretrained(output_dir)
+                # Also save tokenizer if available
+                if self.tokenizer is not None:
+                    self.tokenizer.save_pretrained(output_dir)
+        else:
+            # Standard save (only on main process)
+            if not (dist.is_available() and dist.is_initialized()) or dist.get_rank() == 0:
+                super().save_model(output_dir, _internal_call=_internal_call)
+
+# Backward compatibility
+NonDistributedSeq2SeqTrainer = FiDSeq2SeqTrainer
+
+def train_t5_generator(train_data, val_data, model_name="t5-base", output_dir=None, num_epochs=3, skip_training=False, batch_size=32):
+    """Train T5 generator with multi-GPU support"""
+    # Default output_dir if not provided (for backward compatibility)
+    if output_dir is None:
+        SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+        output_dir = os.path.join(SCRIPT_DIR, "models", "t5_generator")
+    print(f"\n{'='*80}")
+    print(f"Training Generator ({model_name}) for {num_epochs} epochs...")
+    print(f"{'='*80}")
+    print(f"Train samples: {len(train_data)}, Val samples: {len(val_data)}")
+    print(f"Structure: Question and contexts concatenated into single input")
+    
+    # Set environment variables to suppress warnings and optimize memory
+    os.environ['TOKENIZERS_PARALLELISM'] = 'false'  # Suppress tokenizers fork warning
+    os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'  # Reduce memory fragmentation
+    import warnings
+    warnings.filterwarnings('ignore', category=UserWarning, module='torch.nn.parallel')  # Suppress torch gather warning
+    
+    # Multi-GPU support: Detect available GPUs
+    num_gpus = torch.cuda.device_count() if torch.cuda.is_available() else 0
+    if num_gpus > 0:
+        device = torch.device('cuda')
+        # Don't restrict CUDA_VISIBLE_DEVICES - use all available GPUs
+    else:
+        device = torch.device('cpu')
+    
+    # Clean up any existing distributed process group (if any)
+    if dist.is_available():
+        try:
+            if dist.is_initialized():
+                dist.destroy_process_group()
+        except:
+            pass
+    
+    # Format data for T5: Concatenate question and evidences into single string
+    def format_t5_input(question: str, evidences: list) -> str:
+        """Format input for T5: concatenate all passages"""
+        parts = [f"question: {question}"]
+        for evidence in evidences[:3]:  # Max 3 passages
+            if evidence:  # Skip empty
+                parts.append(f"context: {evidence}")
+        return " ".join(parts)
+    
+    formatted_train = []
+    for item in train_data:
+        # Split evidences back to list if it's a string
+        if isinstance(item['evidences'], str):
+            evidences = item['evidences'].split(' ')
+        else:
+            evidences = item['evidences']
+        evidences = evidences[:3]  # Max 3 passages
+        
+        # For T5: concatenate into single string
+        input_text = format_t5_input(item['question'], evidences)
+        formatted_train.append({
+            "input": input_text,
+            "output": item['answer']
+        })
+    
+    formatted_val = []
+    for item in val_data:
+        # Split evidences back to list if it's a string
+        if isinstance(item['evidences'], str):
+            evidences = item['evidences'].split(' ')
+        else:
+            evidences = item['evidences']
+        evidences = evidences[:3]  # Max 3 passages
+        
+        # For T5: concatenate into single string
+        input_text = format_t5_input(item['question'], evidences)
+        formatted_val.append({
+            "input": input_text,
+            "output": item['answer']
+        })
+    
+    train_dataset = Dataset.from_list(formatted_train)
+    val_dataset = Dataset.from_list(formatted_val)
+    
+    print(f"Formatted datasets created: train={len(train_dataset)}, val={len(val_dataset)}")
+    
+    # 원본 output 저장 (디버깅용)
+    train_original_outputs = [item["output"] for item in formatted_train]
+    val_original_outputs = [item["output"] for item in formatted_val]
+    
+    # Load tokenizer and model
+    print(f"Loading {model_name}...")
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
+    
+    # Load model for T5
+    model = AutoModelForSeq2SeqLM.from_pretrained(model_name)
+    model = model.to(device)
+    print(f"Model loaded on {device}")
+    
+    # Tokenize for T5: Single input string (not separate passages)
+    def tokenize_fn(examples):
+        model_inputs = tokenizer(
+            examples["input"],
+            max_length=512,
+            truncation=True,
+            padding="max_length"
+        )
+        labels = tokenizer(
+            examples["output"],
+            max_length=64,
+            truncation=True,
+            padding="max_length"
+        )
+        model_inputs["labels"] = labels["input_ids"]
+        return model_inputs
+    
+    print("Tokenizing datasets...")
+    train_dataset = train_dataset.map(tokenize_fn, batched=True, remove_columns=["input", "output"])
+    val_dataset = val_dataset.map(tokenize_fn, batched=True, remove_columns=["input", "output"])
+    print("Tokenization complete (single input string)")
+    
+    # Training args - Multi-GPU optimized
+    print("Setting up training arguments...")
+    
+    # Optimize batch size for multi-GPU: Use maximum batch size per GPU
+    num_gpus = torch.cuda.device_count() if torch.cuda.is_available() else 1
+    
+    # For T5: Use larger batch sizes
+    if num_gpus >= 4:
+        per_device_batch_size = max(24, batch_size)
+    elif num_gpus >= 2:
+        per_device_batch_size = max(16, batch_size)
+    else:
+        per_device_batch_size = batch_size
+    
+    # Minimize gradient accumulation for speed
+    effective_batch_size = per_device_batch_size * num_gpus
+    gradient_accumulation_steps = 1
+    
+    # Calculate warmup steps (10% of total steps or minimum 100)
+    train_samples = len(train_dataset)
+    effective_batch = per_device_batch_size * num_gpus * gradient_accumulation_steps
+    steps_per_epoch = max(1, train_samples // effective_batch) if effective_batch > 0 else train_samples
+    total_steps = steps_per_epoch * num_epochs
+    warmup_steps = max(100, int(total_steps * 0.1))
+    
+    # Note: Do NOT set max_steps when using num_train_epochs
+    # If both are set, max_steps takes precedence and will override num_train_epochs
+    # For small datasets, we rely on num_train_epochs only
+    
+    training_args = Seq2SeqTrainingArguments(
+        output_dir=output_dir,
+        num_train_epochs=num_epochs,
+        per_device_train_batch_size=per_device_batch_size,  # Optimized for multi-GPU
+        per_device_eval_batch_size=per_device_batch_size,  # Use same batch size for eval
+        gradient_accumulation_steps=gradient_accumulation_steps,  # Maintain effective batch size
+        dataloader_num_workers=8,  # Increase workers for speed
+        dataloader_prefetch_factor=4,  # Increase prefetch for speed
+        fp16=True,  # Enable mixed precision for faster training and less memory
+        gradient_checkpointing=False,  # Disable for speed
+        learning_rate=3e-5,  # Reduced learning rate to prevent overfitting
+        warmup_steps=warmup_steps,  # Dynamic warmup based on dataset size
+        lr_scheduler_type="cosine",  # Cosine learning rate schedule
+        eval_strategy="epoch",  # Evaluate on validation set at end of each epoch
+        save_strategy="epoch",  # Save checkpoint each epoch
+        logging_steps=999999,  # Disable step-by-step logging, only log at epoch end
+        disable_tqdm=False,  # Enable progress bar for each epoch
+        logging_strategy="epoch",  # Only log at end of each epoch
+        predict_with_generate=True,  # Generation 확인을 위해 활성화
+        generation_max_length=64,  # Generation 최대 길이
+        save_total_limit=2,  # Keep last 2 checkpoints
+        load_best_model_at_end=True,  # Load best model based on eval_loss
+        metric_for_best_model="eval_loss",  # Use eval_loss to determine best model
+        greater_is_better=False,  # Lower eval_loss is better
+        save_steps=999999,  # Disable step-based saving (use epoch-based)
+        no_cuda=(device.type == 'cpu'),  # Use CUDA if available
+        ddp_find_unused_parameters=False,  # Optimize for multi-GPU (faster)
+        dataloader_pin_memory=True,  # Pin memory for faster data transfer to GPU
+        report_to='none',  # Disable wandb/tensorboard
+        dataloader_drop_last=False,  # Don't drop last batch for small datasets
+        remove_unused_columns=False,  # Avoid column processing issues
+        skip_memory_metrics=True,  # Skip memory metrics to avoid issues
+        max_grad_norm=1.0,  # Gradient clipping for stability
+        optim="adamw_torch",  # Use standard AdamW optimizer
+        max_steps=-1,  # Use num_train_epochs only, don't override
+    )
+    
+    # CRITICAL: Override any distributed settings
+    training_args.local_rank = -1
+    # Note: world_size and process_index are read-only properties, cannot be set directly
+    # They will be automatically set to 1 and 0 respectively when local_rank=-1
+    
+    print(f"[Generator Training] Multi-GPU training enabled")
+    print(f"[Generator Training] Batch size: {training_args.per_device_train_batch_size}")
+    
+    # Use standard DataCollatorForSeq2Seq for T5
+    from transformers import DataCollatorForSeq2Seq
+    data_collator = DataCollatorForSeq2Seq(tokenizer, model=model, padding=True)
+    
+    # Custom callback to print epoch loss and show epoch-based progress (like retriever training)
+    from transformers import TrainerCallback, TrainerState
+    try:
+        from transformers import EarlyStoppingCallback
+    except ImportError:
+        # Fallback for older transformers versions
+        from transformers.trainer_callback import EarlyStoppingCallback
+    
+    class EpochLossCallback(TrainerCallback):
+        def __init__(self, num_epochs):
+            self.num_epochs = num_epochs
+            self.current_epoch = 0
+        
+        def on_epoch_begin(self, args, state, control, **kwargs):
+            """Print epoch start message"""
+            # state.epoch is 0-indexed float (0.0, 1.0, 2.0, ...)
+            # Convert to 1-indexed integer for display
+            self.current_epoch = int(state.epoch) + 1
+            print(f"\n{'='*80}")
+            print(f"Epoch {self.current_epoch}/{self.num_epochs}")
+            print(f"{'='*80}")
+            # Progress bar will be shown by tqdm during training
+        
+        def on_epoch_end(self, args, state, control, **kwargs):
+            """Print epoch end summary with loss values"""
+            # state.epoch is 0-indexed float, convert to 1-indexed
+            self.current_epoch = int(state.epoch) + 1
+            
+            # Memory cleanup after each epoch
+            if torch.cuda.is_available():
+                import gc
+                gc.collect()
+                torch.cuda.empty_cache()
+                torch.cuda.synchronize()
+            
+            # Get train loss and eval loss from log history
+            train_loss = None
+            eval_loss = None
+            
+            if state.log_history:
+                # Find the last log entry for this epoch
+                epoch_logs = [log for log in state.log_history 
+                             if 'epoch' in log and log.get('epoch', -1) == state.epoch]
+                
+                if epoch_logs:
+                    last_log = epoch_logs[-1]
+                    train_loss = last_log.get('train_loss') or last_log.get('loss')
+                    eval_loss = last_log.get('eval_loss')
+            
+            # Print epoch results (loss values calculated at epoch end)
+            print(f"\n{'='*80}")
+            if train_loss is not None and eval_loss is not None:
+                print(f"Epoch {self.current_epoch}/{self.num_epochs} Summary:")
+                print(f"  Train Loss: {train_loss:.6f}")
+                print(f"  Val Loss: {eval_loss:.6f}")
+            elif train_loss is not None:
+                print(f"Epoch {self.current_epoch}/{self.num_epochs} Summary:")
+                print(f"  Train Loss: {train_loss:.6f}")
+            elif eval_loss is not None:
+                print(f"Epoch {self.current_epoch}/{self.num_epochs} Summary:")
+                print(f"  Val Loss: {eval_loss:.6f}")
+            print(f"{'='*80}\n")
+        
+        def on_step_end(self, args, state, control, **kwargs):
+            # Periodic memory cleanup every 200 steps to prevent OOM (reduced frequency for speed)
+            if state.global_step % 200 == 0 and torch.cuda.is_available():
+                import gc
+                gc.collect()
+                torch.cuda.empty_cache()
+    
+    # Multi-GPU support: Let transformers Trainer handle distributed training automatically
+    # Trainer - Use standard Seq2SeqTrainer for T5
+    from transformers import Seq2SeqTrainer
+    
+    trainer = Seq2SeqTrainer(
+        model=model,
+        args=training_args,
+        train_dataset=train_dataset,
+        eval_dataset=val_dataset,
+        tokenizer=tokenizer,
+        data_collator=data_collator,
+        callbacks=[EpochLossCallback(num_epochs)],  # Add callbacks (early stopping disabled)
+    )
+    
+    # Multi-GPU: Let Trainer automatically handle distributed training
+    # Trainer will detect and use all available GPUs automatically
+    
+    print("Starting training...")
+    
+    training_successful = False
+    
+    try:
+        if skip_training:
+            print("\n[Skipping training - using pre-trained model]")
+            training_successful = True
+        else:
+            # Final check: ensure distributed is not initialized
+            if dist.is_available() and dist.is_initialized():
+                try:
+                    dist.destroy_process_group()
+                except:
+                    pass
+            
+            # Final memory cleanup before training
+            if torch.cuda.is_available():
+                import gc
+                gc.collect()
+                torch.cuda.empty_cache()
+                torch.cuda.synchronize()
+                torch.cuda.empty_cache()
+            
+            trainer.train()
+            print("Training completed successfully")
+            
+            # Manually save model after training
+            trainer.save_model(output_dir)
+            tokenizer.save_pretrained(output_dir)
+            
+            training_successful = True
+    except Exception as e:
+        error_msg = str(e)
+        print(f"\n{'='*80}")
+        print(f"Training error: {error_msg}")
+        print(f"{'='*80}")
+        
+        # Check if it's a distributed error
+        if "process group" in error_msg.lower() or "distributed" in error_msg.lower():
+            print("\nWARNING:  DISTRIBUTED TRAINING ERROR DETECTED")
+            print("This is a known issue with transformers Trainer trying to initialize distributed training.")
+            print("\nAttempting to fix by patching Trainer methods...")
+            
+            # Try to patch and retry
+            try:
+                # More aggressive patching
+                import transformers.trainer
+                original_init_distributed = getattr(transformers.trainer, '_setup_distributed', None)
+                if original_init_distributed:
+                    def noop_setup_distributed(*args, **kwargs):
+                        pass
+                    transformers.trainer._setup_distributed = noop_setup_distributed
+                
+                # Retry training
+                trainer.train()
+                print("Training completed successfully after retry")
+                training_successful = True
+            except Exception as e2:
+                print(f"Retry also failed: {e2}")
+                training_successful = False
+        else:
+            training_successful = False
+        
+        # 오류가 발생해도 최소한의 학습은 진행되었을 수 있으므로 확인
+        if not training_successful:
+            try:
+                # Checkpoint가 있는지 확인
+                import glob
+                checkpoints = glob.glob(f"{output_dir}/checkpoint-*")
+                if checkpoints:
+                    print(f"Found {len(checkpoints)} checkpoints - loading latest checkpoint")
+                    latest_checkpoint = max(checkpoints, key=os.path.getctime)
+                    print(f"Loading latest checkpoint: {latest_checkpoint}")
+                    # Load T5 model
+                    model = AutoModelForSeq2SeqLM.from_pretrained(latest_checkpoint).to(device)
+                    trainer.model = model
+                    print(f"OK: Loaded model from checkpoint")
+                    training_successful = True
+            except Exception as e2:
+                print(f"WARNING:  Failed to load from checkpoint: {e2}")
+                pass  # Silent fail - will use untrained model
+    
+    # 학습이 성공했는지 확인
+    if not training_successful:
+        print("\n" + "="*80)
+        print("WARNING:  CRITICAL WARNING: Generator training failed or incomplete!")
+        print("WARNING:  The model may not be trained, which will result in EM=0, F1=0")
+        print("="*80)
+        print("\nTo fix this:")
+        print("1. Check the training logs above for errors")
+        print("2. Try reducing batch size or number of epochs")
+        print("3. Ensure sufficient GPU memory")
+        print("="*80 + "\n")
+    
+    # Model saving is already handled in training block
+    # Only save tokenizer if not already saved
+    if not os.path.exists(os.path.join(output_dir, "tokenizer_config.json")):
+        print(f"Saving tokenizer to {output_dir}")
+        tokenizer.save_pretrained(output_dir)
+        print("Tokenizer saved")
+    
+    return model, tokenizer
+
