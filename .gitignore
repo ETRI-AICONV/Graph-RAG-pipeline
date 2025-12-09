@@ -1,0 +1,35 @@
+# Cache files
+cache/
+cache/**/*.pkl
+*.pkl
+
+# Model files (too large for Git)
+models/
+models/**/*
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# Environments
+.env
+.venv
+env/
+venv/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Logs
+*.log
+
+# Temporary files
+*.tmp
+*.temp
+

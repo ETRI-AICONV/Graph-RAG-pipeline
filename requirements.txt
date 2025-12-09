@@ -1,0 +1,19 @@
+# HotpotQA Graph-RAG Pipeline Requirements
+# Python 3.8+
+
+# Core ML Libraries
+torch>=2.0.0
+numpy>=1.24.0
+
+# HuggingFace Libraries
+transformers>=4.30.0
+datasets>=2.0.0
+sentence-transformers>=2.2.0
+
+# Utilities
+tqdm>=4.65.0
+
+# Optional: For better performance
+# accelerate>=0.20.0  # For multi-GPU training
+# bitsandbytes>=0.39.0  # For quantization (optional)
+
