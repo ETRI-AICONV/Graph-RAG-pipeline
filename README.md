@@ -28,8 +28,8 @@ python -c "import torch; print(f'CUDA: {torch.cuda.is_available()}')"
 # Train with full dataset
 python main.py \
     --samples all \
-    --retriever_epochs 20 \
-    --generator_epochs 3
+    --retriever_epochs 5 \
+    --generator_epochs 5
 ```
 
 ## Command Line Arguments
@@ -37,8 +37,8 @@ python main.py \
 | Option | Description | Default |
 |--------|-------------|---------|
 | `--samples` | Number of samples (`all` or number) | `all` |
-| `--retriever_epochs` | Retriever training epochs | `20` |
-| `--generator_epochs` | Generator training epochs | `3` |
+| `--retriever_epochs` | Retriever training epochs | `5` |
+| `--generator_epochs` | Generator training epochs | `5` |
 | `--cache_dir` | Cache directory path | `<script_dir>/cache` |
 | `--models_dir` | Models directory path | `<script_dir>/models` |
 | `--skip_cache` | Skip cache and rebuild | `False` |
@@ -58,8 +58,19 @@ python main.py \
 ```
 hotpot_git/
 ├── main.py                             # Main pipeline script
-├── graph_utils.py                      # Graph utilities
-├── gpu_utils.py                        # GPU auto-selection utilities
+├── src/                                # Core modules
+│   ├── __init__.py
+│   ├── config.py                       # Configuration constants
+│   ├── models.py                       # GAT model (GATLayer, HierarchicalQueryAwareGATRetriever)
+│   ├── losses.py                       # Loss functions (ContrastiveLoss, WeightedRankingLoss)
+│   ├── cache.py                        # Cache building (build_hierarchical_graph_cache, build_labels)
+│   ├── retriever.py                    # Retriever training and inference
+│   ├── generator.py                     # Generator training
+│   └── evaluation.py                    # Evaluation functions
+├── utils/                               # Utility modules
+│   ├── __init__.py
+│   ├── graph_utils.py                  # Graph utilities
+│   └── gpu_utils.py                    # GPU auto-selection
 ├── requirements.txt                    # Python dependencies
 ├── README.md                           # This file
 ├── cache/                              # Cache files (auto-created, git-ignored)
@@ -67,9 +78,7 @@ hotpot_git/
 │   ├── val_cache_*.pkl
 │   └── test_cache_*.pkl
 └── models/                             # Trained models (auto-created, git-ignored)
-    ├── hierarchical_graph_rag_retriever.pt
-    └── t5_generator/
-        └── ...
+    └── hierarchical_graph_rag_retriever.pt
 ```
 
 ## Output
@@ -78,8 +87,7 @@ The pipeline outputs:
 
 1. **Cache files**: Pre-computed graph structures (`.pkl` files)
 2. **Retriever model**: `models/hierarchical_graph_rag_retriever.pt`
-3. **Generator model**: `models/t5_generator/`
-4. **Evaluation results**: Printed to console
+3. **Evaluation results**: Printed to console
    - Supporting Facts EM/F1
    - Hit@K metrics
    - Answer EM/F1 (with gold facts)

@@ -6,7 +6,7 @@ HotpotQA Graph-RAG 통합 파이프라인
 - 평가: Sup (retrieval), Answer (gold→gen), Joint (E2E)
 
 Usage:
-    python main.py --samples 100 --retriever_epochs 20 --generator_epochs 3
+    python main.py --samples 100 --retriever_epochs 5 --generator_epochs 5
 """
 
 import os
@@ -40,9 +40,9 @@ def main():
     parser = argparse.ArgumentParser(description="HotpotQA Graph-RAG Pipeline")
     parser.add_argument("--samples", type=str, default=None, 
                         help="Number of samples to process (default: all, or use 'all' for full dataset)")
-    parser.add_argument("--retriever_epochs", type=int, default=20, 
+    parser.add_argument("--retriever_epochs", type=int, default=5, 
                         help="Number of training epochs for retriever")
-    parser.add_argument("--generator_epochs", type=int, default=3, 
+    parser.add_argument("--generator_epochs", type=int, default=5, 
                         help="Number of training epochs for generator")
     parser.add_argument("--skip_cache", action="store_true", 
                         help="Skip cache and rebuild (force new cache creation)")
