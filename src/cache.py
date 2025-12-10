@@ -40,8 +40,6 @@ def build_hierarchical_graph_cache(split_ds, split_name, cache_path, max_samples
             cached_size = len(cached)
             expected_size = max_samples if max_samples else len(split_ds)
             
-            # 캐시 크기 확인: 정확히 일치해야 함
-            # 전체 데이터셋 요청(max_samples=None)일 때는 캐시가 전체 크기와 정확히 일치해야 함
             if cached_size == expected_size:
                 print(f"Loading {split_name} cache from {cache_path} ({cached_size} samples)")
                 # Move to current device and ensure hierarchical graph fields exist
@@ -108,7 +106,7 @@ def build_hierarchical_graph_cache(split_ds, split_name, cache_path, max_samples
     if len(available_gpus) > 1 and (max_samples is None or max_samples > 10):
         try:
             use_multi_gpu = True
-            num_workers = min(len(available_gpus), 4)  # 최대 4개 워커
+            num_workers = min(len(available_gpus), 4)
         except Exception as e:
             use_multi_gpu = False
             num_workers = 1
@@ -120,7 +118,6 @@ def build_hierarchical_graph_cache(split_ds, split_name, cache_path, max_samples
     if max_samples:
         samples = samples[:max_samples]
     
-    # 샘플 처리 함수
     def process_sample(i, gpu_id=None):
         """단일 샘플 처리 함수"""
         try:
@@ -210,7 +207,6 @@ def build_hierarchical_graph_cache(split_ds, split_name, cache_path, max_samples
             traceback.print_exc()
             return i, None
     
-    # 병렬 처리 실행 (Multi-GPU) 또는 순차 처리 (Single-GPU)
     if use_multi_gpu and num_workers > 1:
         print(f"Processing {len(samples)} samples in parallel using {num_workers} workers...")
         cache_lock = Lock()
