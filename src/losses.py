@@ -9,9 +9,7 @@ from .config import DEVICE
 
 class ContrastiveLoss(nn.Module):
     """InfoNCE-based Contrastive Loss for Retrieval
-    
-    Positive와 Negative를 명확히 구분하도록 학습
-    InfoNCE: log(exp(pos_score) / (exp(pos_score) + sum(exp(neg_scores))))
+       InfoNCE: log(exp(pos_score) / (exp(pos_score) + sum(exp(neg_scores))))
     """
     
     def __init__(self, temperature=0.07, pos_weight=1.0):
@@ -117,7 +115,6 @@ class WeightedRankingLoss(nn.Module):
             max_pos_score = pos_scores.max()
             min_pos_score = pos_scores.min()
             mean_pos_score = pos_scores.mean()
-            # CRITICAL: 더 엄격한 기준 - 평균보다 높은 negative만 선택
             hard_neg_mask = neg_scores_all > mean_pos_score  # Hard negatives: score > mean(positive scores)
             
             if hard_neg_mask.sum() > 0:
@@ -167,26 +164,20 @@ class WeightedRankingLoss(nn.Module):
             return torch.tensor(0.0, device=scores.device, requires_grad=True)
         
         # Create pairs: for each positive, compare with selected negatives
-        # We want: pos_score > neg_score + margin
         pos_expanded = pos_scores.unsqueeze(1)  # (num_pos, 1)
         neg_expanded = neg_scores.unsqueeze(0)  # (1, num_neg)
         
         # Margin ranking loss: max(0, margin - (pos_score - neg_score))
-        # We want: pos_score > neg_score + margin
         losses = F.relu(self.margin - (pos_expanded - neg_expanded))  # (num_pos, num_neg)
         
         # Weight 계산: positive 샘플에 더 높은 weight 부여
         if self.auto_weight:
-            # 자동 weight: num_neg / num_pos (class imbalance 반영)
-            # 예: pos=2, neg=98 → weight=49.0 (너무 높을 수 있음)
-            # 따라서 sqrt를 적용하여 완화
             weight = torch.sqrt(torch.tensor(num_neg / max(num_pos, 1), device=scores.device, dtype=torch.float32))
             # 최대 weight 제한 (너무 높은 weight 방지)
             weight = torch.clamp(weight, min=1.0, max=10.0)
         else:
             weight = self.pos_weight
         
-        # Weighted loss: positive 쌍에 더 높은 weight
         weighted_losses = losses * weight  # (num_pos, num_neg)
         
         # Average over all pairs
