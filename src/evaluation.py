@@ -22,6 +22,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from utils.graph_utils import flatten_context, get_gold_indices, supporting_fact_em, supporting_fact_f1, batch_embed, build_hierarchical_graph
 from utils.gpu_utils import set_device_auto, get_available_gpus
 from .config import DEVICE, AVAILABLE_GPUS, MODEL_NAME, HIDDEN_DIM, GNN_LAYERS, THRESHOLD
+from .retriever import retrieve_supporting_facts
+from .generator import compute_answer_em_f1
 
 from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
 
@@ -43,6 +45,8 @@ def evaluate_hierarchical_graph_rag_pipeline(cache, retriever_model, generator_m
     skipped_count = 0
     processed_count = 0
     debug_count = 0  # Track number of debug outputs
+    
+    # Debug: Cache size (removed for cleaner output)
     
     for sid, entry in tqdm(cache.items(), desc=f"Evaluating {mode}"):
         gold_idx = entry.get("gold", [])
@@ -68,16 +72,30 @@ def evaluate_hierarchical_graph_rag_pipeline(cache, retriever_model, generator_m
                 )
                 
                 # For EM/F1, use gold_count to match the number
+                gold_count_for_retrieval = max(2, min(len(gold_sents), 10))  # At least 2, at most 10
                 pred_facts = retrieve_supporting_facts(
                     entry, 
                     eval_model, 
                     threshold=THRESHOLD,
-                    gold_count=len(gold_sents)
+                    gold_count=gold_count_for_retrieval
                 )
                 
-                if not pred_facts or not pred_facts_top10:
-                    skipped_count += 1
-                    continue
+                # Debug output removed for cleaner logs
+                debug_count += 1
+                
+                if not pred_facts or len(pred_facts) == 0:
+                    # Try fallback: get top-k without filtering
+                    if not pred_facts_top10 or len(pred_facts_top10) == 0:
+                        if debug_count <= 3:
+                            print(f"  WARNING: Both pred_facts and pred_facts_top10 are empty!")
+                        skipped_count += 1
+                        continue
+                    else:
+                        # Use top10 if pred_facts is empty
+                        pred_facts = pred_facts_top10[:len(gold_sents)] if gold_sents else pred_facts_top10[:3]
+                if not pred_facts_top10 or len(pred_facts_top10) == 0:
+                    # Use pred_facts as fallback for top10
+                    pred_facts_top10 = pred_facts
                 
                 # Extract text from dict format (backward compatibility)
                 pred_sents = [fact['text'] if isinstance(fact, dict) else fact for fact in pred_facts]
@@ -263,8 +281,8 @@ def evaluate_hierarchical_graph_rag_pipeline(cache, retriever_model, generator_m
         }
     elif mode in ["answer", "joint"]:
         # Generator/Joint: return ans metrics only
-        ans_em_mean = np.mean(ems_ans) if ems_ans else 0.0
-        ans_f1_mean = np.mean(f1s_ans) if f1s_ans else 0.0
+        ans_em_mean = np.mean(ems_ans) if ems_ans and len(ems_ans) > 0 else 0.0
+        ans_f1_mean = np.mean(f1s_ans) if f1s_ans and len(f1s_ans) > 0 else 0.0
         result = {"ans_em": ans_em_mean, "ans_f1": ans_f1_mean}
     
     return result

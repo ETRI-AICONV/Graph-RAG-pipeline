@@ -476,23 +476,29 @@ def retrieve_supporting_facts(entry, model, threshold=THRESHOLD, top_k=None, gol
     # Strategy 1 제거: Threshold-based selection은 점수가 낮아서 효과 없음
     
     # Strategy 2: Top-k 사용 (항상 사용)
-    for idx in topk_indices.cpu().tolist():
+    # idx는 sentence index (0부터 n_sentences-1까지)
+    for i, idx in enumerate(topk_indices.cpu().tolist()):
         if len(pred_facts) >= top_k:
             break
-        sent_node_idx = 1 + num_docs + idx
-        if sent_node_idx < len(node_texts):
-            sent_text = node_texts[sent_node_idx]
-            if sent_text in sents and sent_text not in seen_sents:
-                # Get (doc_id, local_sent_id)
-                doc_id, local_sent_id = -1, -1
+        
+        # idx is the sentence index in sents array
+        if idx < len(sents):
+            sent_text = sents[idx]
+            
+            # Get metadata
+            doc_id, local_sent_id = -1, -1
+            if idx < len(sent_metadata):
+                doc_id, local_sent_id = sent_metadata[idx]
+            elif idx < len(node_metadata):
+                # Try to get from node_metadata (sentence nodes start after query + docs)
+                sent_node_idx = 1 + num_docs + idx
                 if sent_node_idx < len(node_metadata):
                     meta = node_metadata[sent_node_idx]
                     if meta.get("type") == "sentence":
                         doc_id = meta.get("doc_id", -1)
                         local_sent_id = meta.get("local_sent_id", -1)
-                elif idx < len(sent_metadata):
-                    doc_id, local_sent_id = sent_metadata[idx]
-                
+            
+            if sent_text not in seen_sents:
                 pred_facts.append({
                     'text': sent_text,
                     'doc_id': doc_id,
@@ -502,6 +508,7 @@ def retrieve_supporting_facts(entry, model, threshold=THRESHOLD, top_k=None, gol
     
     # Strategy 3: Final fallback if still empty
     if not pred_facts:
+        # Fallback: just return first top_k sentences
         for i in range(min(top_k, len(sents))):
             doc_id, local_sent_id = sent_metadata[i] if i < len(sent_metadata) else (-1, -1)
             pred_facts.append({
@@ -510,5 +517,6 @@ def retrieve_supporting_facts(entry, model, threshold=THRESHOLD, top_k=None, gol
                 'local_sent_id': local_sent_id
             })
     
-    return pred_facts[:top_k]  # Return up to top_k facts with metadata
+    # Always return at least something, even if empty (let evaluation handle it)
+    return pred_facts[:top_k] if pred_facts else []  # Return up to top_k facts with metadata
 
